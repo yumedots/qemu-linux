@@ -86,6 +86,11 @@ struct _DBusDisplayListener {
 #else /* !WIN32 */
     QemuDBusDisplay1ListenerUnixMap *map_proxy;
     QemuDBusDisplay1ListenerUnixScanoutDMABUF2 *scanout_dmabuf_v2_proxy;
+
+    struct {
+        uint32_t tex_id;
+        uint32_t w, h, bw, bh;
+    } dmabuf_cache[8];
 #endif
 
     guint dbus_filter;
@@ -119,6 +124,7 @@ static void dbus_scanout_disable(DisplayChangeListener *dcl)
 {
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
 
+    memset(ddl->dmabuf_cache, 0, sizeof(ddl->dmabuf_cache));
     ddl_discard_display_messages(ddl);
 
     qemu_dbus_display1_listener_call_disable(
@@ -596,8 +602,23 @@ static void dbus_scanout_texture(DisplayChangeListener *dcl,
     int fd[DMABUF_MAX_PLANES], num_planes;
     uint32_t offset[DMABUF_MAX_PLANES], stride[DMABUF_MAX_PLANES], fourcc;
     uint64_t modifier;
+    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+    int slot = -1;
 
     assert(tex_id);
+
+    for (int i = 0; i < 8; i++) {
+        if (ddl->dmabuf_cache[i].tex_id == tex_id &&
+            ddl->dmabuf_cache[i].w == w && ddl->dmabuf_cache[i].h == h &&
+            ddl->dmabuf_cache[i].bw == backing_width &&
+            ddl->dmabuf_cache[i].bh == backing_height) {
+            dbus_call_update_gl(dcl, x, y, w, h);
+            return;
+        }
+        if (slot < 0 || ddl->dmabuf_cache[i].tex_id == 0) {
+            slot = i;
+        }
+    }
     if (!egl_dmabuf_export_texture(tex_id, fd, (EGLint *)offset, (EGLint *)stride,
                                    (EGLint *)&fourcc, &num_planes, &modifier)) {
         error_report("%s: failed to export dmabuf for texture", __func__);
@@ -608,6 +629,13 @@ static void dbus_scanout_texture(DisplayChangeListener *dcl,
                              false, backing_y_0_top);
 
     dbus_scanout_dmabuf(dcl, dmabuf);
+    if (slot >= 0) {
+        ddl->dmabuf_cache[slot].tex_id = tex_id;
+        ddl->dmabuf_cache[slot].w = w;
+        ddl->dmabuf_cache[slot].h = h;
+        ddl->dmabuf_cache[slot].bw = backing_width;
+        ddl->dmabuf_cache[slot].bh = backing_height;
+    }
     qemu_dmabuf_close(dmabuf);
 #endif
 
@@ -713,7 +741,7 @@ static void dbus_gl_refresh(DisplayChangeListener *dcl)
 
     qemu_console_hw_update(dcl->con);
 
-    if (!ddl->ds || qemu_console_is_gl_blocked(ddl->dcl.con)) {
+    if (!ddl->ds || ddl->ds->texture == 0 || qemu_console_is_gl_blocked(ddl->dcl.con)) {
         return;
     }
 
@@ -744,10 +772,18 @@ static void dbus_refresh(DisplayChangeListener *dcl)
 }
 
 #ifdef CONFIG_OPENGL
+static void dbus_gfx_update(DisplayChangeListener *dcl,
+                            int x, int y, int w, int h);
+
 static void dbus_gl_gfx_update(DisplayChangeListener *dcl,
                                int x, int y, int w, int h)
 {
     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+
+    if (ddl->ds && ddl->ds->texture == 0) {
+        dbus_gfx_update(dcl, x, y, w, h);
+        return;
+    }
 
 #ifdef CONFIG_PIXMAN
     pixman_region32_t rect_region;
@@ -862,14 +898,18 @@ static void dbus_gl_gfx_switch(DisplayChangeListener *dcl,
 
     ddl->ds = new_surface;
     ddl->ds_share = SHARE_KIND_NONE;
-    if (ddl->ds) {
-        int width = surface_width(ddl->ds);
-        int height = surface_height(ddl->ds);
-
-        /* TODO: lazy send dmabuf (there are unnecessary sent otherwise) */
-        dbus_scanout_texture(&ddl->dcl, ddl->ds->texture, false,
-                             width, height, 0, 0, width, height, NULL);
+    if (!ddl->ds) {
+        return;
     }
+    if (ddl->ds->texture == 0) {
+        return;
+    }
+    int width = surface_width(ddl->ds);
+    int height = surface_height(ddl->ds);
+
+    /* TODO: lazy send dmabuf (there are unnecessary sent otherwise) */
+    dbus_scanout_texture(&ddl->dcl, ddl->ds->texture, false,
+                         width, height, 0, 0, width, height, NULL);
 }
 #endif
 

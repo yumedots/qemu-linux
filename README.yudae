@@ -1,0 +1,28 @@
+# yudae QEMU
+
+QEMU 11.1.3 with the display fixes the yudae VM viewer needs.
+
+## Build
+
+```
+mkdir build && cd build
+../configure --prefix=$HOME/qemu-linux/install --target-list=x86_64-softmmu \
+  --enable-kvm --enable-opengl --enable-virglrenderer --enable-dbus-display \
+  --enable-vhost-user --enable-virtfs --enable-slirp \
+  --disable-gtk --disable-sdl --disable-spice --disable-docs --disable-tools \
+  --disable-guest-agent --disable-werror
+ninja && ninja install
+```
+
+## Patch
+
+`ui/dbus-listener.c`:
+
+- cache dmabuf exports by texture id, size and backing size; repeat scanouts send `UpdateDMABUF` instead of re-exporting the texture
+- route pixman surfaces without a GL texture through `ScanoutMap`/`Update` instead of dropping them
+- skip `UpdateDMABUF` for surfaces without a GL texture
+
+## Known open
+
+- the guest compositor stops presenting when the dbus display has no listener; a listener is required as a pump
+- the viewer ack path needs a real event loop; the reference spike reaches 5-27 updates/s

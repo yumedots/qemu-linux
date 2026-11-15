@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/host-utils.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/virtio/vhost-user-base.h"
 #include "hw/virtio/virtio-pci.h"
@@ -59,8 +60,13 @@ static void vhost_user_device_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp
             error_setg(errp, "modern-pio-notify is not supported due to PCI BAR layout limitations");
             return;
         }
+        /*
+         * A BAR is a power of two (pci_register_bar asserts it), and the
+         * regions need not add up to one: 1 GiB + 32 GiB is 33. The tail
+         * past the last region is left unbacked.
+         */
         memory_region_init(&dev->shmembar, OBJECT(vpci_dev),
-                           "vhost-device-pci-shmembar", shmem_size);
+                           "vhost-device-pci-shmembar", pow2ceil(shmem_size));
         QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
             memory_region_add_subregion(&dev->shmembar, offset, &shmem->mr);
             virtio_pci_add_shm_cap(vpci_dev, VIRTIO_DEVICE_PCI_SHMEM_BAR,

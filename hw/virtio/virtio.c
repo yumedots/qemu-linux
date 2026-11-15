@@ -3178,6 +3178,15 @@ static void virtio_shared_memory_mapping_instance_finalize(Object *obj)
         object_unparent(OBJECT(mapping->mr));
         mapping->mr = NULL;
     }
+    /*
+     * A fixed-VA mapping's MemoryRegion borrows the pages. The flatviews
+     * that used it each held a reference on this object, so nothing can
+     * reach the range by the time it is finalized.
+     */
+    if (mapping->fixed_va) {
+        munmap(mapping->fixed_va, mapping->len);
+        mapping->fixed_va = NULL;
+    }
 }
 
 VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
@@ -3236,6 +3245,67 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
 
     mapping->mr = mr;
     return mapping;
+}
+
+VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new_fixed_va(
+    uint8_t shmid, int fd, uint64_t fd_offset, uint64_t shm_offset,
+    uint64_t len)
+{
+#ifdef MAP_FIXED_NOREPLACE
+    VirtioSharedMemoryMapping *mapping;
+    g_autoptr(GString) mr_name = g_string_new(NULL);
+    uintptr_t page = qemu_real_host_page_size();
+    MemoryRegion *mr;
+    void *p;
+
+    if (len == 0 || fd_offset == 0 || fd_offset % page || len % page ||
+        fd_offset + len < fd_offset || fd_offset + len > UINTPTR_MAX) {
+        error_report("Bad fixed-VA shared memory mapping %" PRIx64 "+%" PRIx64,
+                     fd_offset, len);
+        return NULL;
+    }
+
+    p = mmap((void *)(uintptr_t)fd_offset, len, PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_FIXED_NOREPLACE, fd, fd_offset);
+    if (p == MAP_FAILED) {
+        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
+                     ": %s", fd_offset, strerror(errno));
+        return NULL;
+    }
+    if ((uintptr_t)p != fd_offset) {
+        /* A kernel without MAP_FIXED_NOREPLACE takes it as a hint. */
+        munmap(p, len);
+        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
+                     ": address in use", fd_offset);
+        return NULL;
+    }
+#ifdef MADV_POPULATE_WRITE
+    /* Probe one page: a managed range's pages are UVM's to place. */
+    if (madvise(p, page, MADV_POPULATE_WRITE) != 0) {
+        error_report("Fixed-VA shared memory mapping at 0x%" PRIx64
+                     ": populate: %s", fd_offset, strerror(errno));
+        munmap(p, len);
+        return NULL;
+    }
+#endif
+
+    mapping = VIRTIO_SHARED_MEMORY_MAPPING(
+        object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
+    mapping->shmid = shmid;
+    mapping->offset = shm_offset;
+    mapping->len = len;
+    mapping->fixed_va = p;
+
+    mr = g_new0(MemoryRegion, 1);
+    g_string_printf(mr_name, "virtio-shmem-%d-%" PRIx64 "-fixed", shmid,
+                    shm_offset);
+    memory_region_init_ram_ptr(mr, OBJECT(mapping), mr_name->str, len, p);
+    mapping->mr = mr;
+    return mapping;
+#else
+    error_report("Fixed-VA shared memory mappings need MAP_FIXED_NOREPLACE");
+    return NULL;
+#endif
 }
 
 int virtio_add_shmem_map(VirtioSharedMemory *shmem,

@@ -262,6 +262,13 @@ typedef struct VhostUserShared {
 
 /* For the flags field of VhostUserMMap */
 #define VHOST_USER_FLAG_MAP_RW (1u << 0)
+/*
+ * Conduit extension, not in the vhost-user spec: map the fd at host virtual
+ * address fd_offset (read-write, shared). A spec frontend ignores the bit
+ * and its mapping of such an fd simply fails. See
+ * virtio_shared_memory_mapping_new_fixed_va().
+ */
+#define VHOST_USER_FLAG_MAP_FIXED_VA (1u << 1)
 
 typedef struct {
     /* VIRTIO Shared Memory Region ID */
@@ -1989,9 +1996,14 @@ vhost_user_backend_handle_shmem_map(struct vhost_dev *dev,
     memory_region_transaction_begin();
 
     /* Create VirtioSharedMemoryMapping object */
-    VirtioSharedMemoryMapping *mapping = virtio_shared_memory_mapping_new(
-        vu_mmap->shmid, fd, vu_mmap->fd_offset, vu_mmap->shm_offset,
-        vu_mmap->len, vu_mmap->flags & VHOST_USER_FLAG_MAP_RW);
+    VirtioSharedMemoryMapping *mapping =
+        (vu_mmap->flags & VHOST_USER_FLAG_MAP_FIXED_VA) ?
+        virtio_shared_memory_mapping_new_fixed_va(
+            vu_mmap->shmid, fd, vu_mmap->fd_offset, vu_mmap->shm_offset,
+            vu_mmap->len) :
+        virtio_shared_memory_mapping_new(
+            vu_mmap->shmid, fd, vu_mmap->fd_offset, vu_mmap->shm_offset,
+            vu_mmap->len, vu_mmap->flags & VHOST_USER_FLAG_MAP_RW);
 
     if (!mapping) {
         ret = -EFAULT;

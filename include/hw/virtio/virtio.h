@@ -127,6 +127,8 @@ struct VirtioSharedMemoryMapping {
     hwaddr offset;
     uint64_t len;
     MemoryRegion *mr;
+    /* Set when mapped at a backend-chosen host address (fixed VA). */
+    void *fixed_va;
     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
 };
 
@@ -389,6 +391,21 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
                                                             uint64_t shm_offset,
                                                             uint64_t len,
                                                             bool allow_write);
+
+/**
+ * virtio_shared_memory_mapping_new_fixed_va() - As above, at a fixed address
+ *
+ * Maps @fd shared and read-write at host virtual address @fd_offset, which is
+ * also the file offset. Some device files only accept a mapping whose address
+ * equals its offset (nvidia-uvm: vm_start == vm_pgoff << PAGE_SHIFT), so the
+ * usual mapping at an address of QEMU's choosing cannot reach them. Never
+ * replaces an existing mapping (MAP_FIXED_NOREPLACE).
+ *
+ * Return: A new VirtioSharedMemoryMapping on success, NULL on error.
+ */
+VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new_fixed_va(
+    uint8_t shmid, int fd, uint64_t fd_offset, uint64_t shm_offset,
+    uint64_t len);
 
 /**
  * virtio_add_shmem_map() - Add a memory mapping to a shared region

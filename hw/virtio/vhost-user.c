@@ -51,7 +51,13 @@
 /*
  * Maximum size of virtio device config space
  */
-#define VHOST_USER_MAX_CONFIG_SIZE 256
+/*
+ * Device config is read whole through GET_CONFIG. 256 bytes fits the
+ * in-tree devices but not every vhost-user-test-device backend (virtio-nvgpu
+ * serves 4036). The virtio-pci device config window is 4 KiB, and the
+ * rust-vmm vhost crate accepts offset + size up to 4096, so match that.
+ */
+#define VHOST_USER_MAX_CONFIG_SIZE 4096
 
 #define VHOST_USER_PROTOCOL_FEATURE_MASK ((1 << VHOST_USER_PROTOCOL_F_MAX) - 1)
 

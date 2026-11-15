@@ -85,6 +85,12 @@ static void vhost_user_device_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp
 static const Property vhost_user_device_pci_properties[] = {
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
                        DEV_NVECTORS_UNSPECIFIED),
+    /*
+     * The PCI class the device reports (as virtio-blk-pci's "class"):
+     * 0 keeps "communication controller". A GPU device sets 0x0300 so a
+     * guest's display stack (Windows' DXGK) treats it as a display adapter.
+     */
+    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
 };
 
 static void vhost_user_device_pci_class_init(ObjectClass *klass,

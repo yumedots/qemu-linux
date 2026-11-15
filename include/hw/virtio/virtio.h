@@ -129,12 +129,25 @@ struct VirtioSharedMemoryMapping {
     MemoryRegion *mr;
     /* Set when mapped at a backend-chosen host address (fixed VA). */
     void *fixed_va;
+    /*
+     * Set when the fd is mapped inside the region's backing with MAP_FIXED
+     * (virtio_shmem_place()): there is no MemoryRegion of its own, and
+     * taking it out overwrites the range rather than deleting a memslot.
+     */
+    bool in_place;
     QTAILQ_ENTRY(VirtioSharedMemoryMapping) link;
 };
 
 struct VirtioSharedMemory {
     uint8_t shmid;
     MemoryRegion mr;
+    /*
+     * One RAM region over a reserved range the size of the whole region,
+     * made on the first in-place mapping: one KVM memslot for the life of
+     * the device, which mappings are mmap()ed into and out of. NULL until
+     * then (and for a region only ever given fixed-VA mappings).
+     */
+    VirtioSharedMemoryMapping *backing;
     QTAILQ_HEAD(, VirtioSharedMemoryMapping) mmaps;
     QSIMPLEQ_ENTRY(VirtioSharedMemory) entry;
 };
@@ -406,6 +419,27 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new(uint8_t shmid,
 VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new_fixed_va(
     uint8_t shmid, int fd, uint64_t fd_offset, uint64_t shm_offset,
     uint64_t len);
+
+/**
+ * virtio_shmem_place() - Map an fd inside a region without a memslot update
+ * @shmem: VirtioSharedMemory region
+ * @fd: File descriptor to map (not consumed)
+ * @fd_offset: Offset within the file descriptor
+ * @shm_offset: Offset within the region (page aligned)
+ * @len: Size of the mapping (page aligned)
+ *
+ * Maps @fd shared and read-write over @shm_offset of the region's backing
+ * with MAP_FIXED, creating the backing on first use. KVM sees an MMU
+ * notifier invalidation of that range and nothing else: no memslot is
+ * created, and none is deleted by virtio_del_shmem_map() later, where the
+ * range is overwritten with fresh anonymous memory. A memslot deletion on
+ * x86 zaps every SPTE of the VM (KVM_X86_QUIRK_SLOT_ZAP_ALL), which a guest
+ * that maps and unmaps device memory often pays tens of milliseconds for.
+ *
+ * Returns: 0 on success, -1 on error (the range is left empty).
+ */
+int virtio_shmem_place(VirtioSharedMemory *shmem, int fd, uint64_t fd_offset,
+                       uint64_t shm_offset, uint64_t len);
 
 /**
  * virtio_add_shmem_map() - Add a memory mapping to a shared region

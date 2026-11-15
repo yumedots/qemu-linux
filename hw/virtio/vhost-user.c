@@ -1993,6 +1993,26 @@ vhost_user_backend_handle_shmem_map(struct vhost_dev *dev,
         }
     }
 
+    /*
+     * A writable, page-aligned mapping goes inside the region's one memslot
+     * (virtio_shmem_place()): an mmap, with no memory transaction and no
+     * KVM memslot created now or deleted at unmap. Fixed-VA mappings, which
+     * must sit at an address of the fd's choosing, and read-only ones, which
+     * need a read-only memslot, keep a MemoryRegion of their own.
+     */
+    if (!(vu_mmap->flags & VHOST_USER_FLAG_MAP_FIXED_VA) &&
+        (vu_mmap->flags & VHOST_USER_FLAG_MAP_RW) &&
+        QEMU_IS_ALIGNED(vu_mmap->shm_offset, qemu_real_host_page_size()) &&
+        QEMU_IS_ALIGNED(vu_mmap->fd_offset, qemu_real_host_page_size()) &&
+        QEMU_IS_ALIGNED(vu_mmap->len, qemu_real_host_page_size()) &&
+        vu_mmap->len) {
+        if (virtio_shmem_place(shmem, fd, vu_mmap->fd_offset,
+                               vu_mmap->shm_offset, vu_mmap->len) != 0) {
+            ret = -EFAULT;
+        }
+        goto send_reply;
+    }
+
     memory_region_transaction_begin();
 
     /* Create VirtioSharedMemoryMapping object */
@@ -2109,6 +2129,16 @@ vhost_user_backend_handle_shmem_unmap(struct vhost_dev *dev,
                      vu_mmap->shm_offset, vu_mmap->len);
         ret = -EFAULT;
         goto send_reply;
+    }
+
+    /*
+     * An in-place mapping is taken out before the reply: it costs an mmap,
+     * and once the backend hears back it may hand the range to another
+     * mapping, which must find the old one gone.
+     */
+    if (mmap->in_place) {
+        virtio_del_shmem_map(shmem, vu_mmap->shm_offset, vu_mmap->len);
+        mmap = NULL;
     }
 
 send_reply:

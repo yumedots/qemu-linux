@@ -3308,6 +3308,93 @@ VirtioSharedMemoryMapping *virtio_shared_memory_mapping_new_fixed_va(
 #endif
 }
 
+/* Fresh, empty memory over [p, p + len): what an unplaced range holds. */
+static void *virtio_shmem_empty(void *p, uint64_t len)
+{
+    return mmap(p, len, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                (p ? MAP_FIXED : 0), -1, 0);
+}
+
+static VirtioSharedMemoryMapping *virtio_shmem_backing(VirtioSharedMemory *shmem)
+{
+    g_autoptr(GString) mr_name = g_string_new(NULL);
+    VirtioSharedMemoryMapping *backing;
+    uint64_t size = memory_region_size(&shmem->mr);
+    MemoryRegion *mr;
+    void *p;
+
+    if (shmem->backing) {
+        return shmem->backing;
+    }
+    p = virtio_shmem_empty(NULL, size);
+    if (p == MAP_FAILED) {
+        error_report("VIRTIO Shared Memory Region %d: reserving 0x%" PRIx64
+                     " bytes: %s", shmem->shmid, size, strerror(errno));
+        return NULL;
+    }
+    /*
+     * Owned by a mapping object, so the vhost memory listener leaves it out
+     * of the backend's memory table as it does every shmem mapping, and its
+     * finalize unmaps the range.
+     */
+    backing = VIRTIO_SHARED_MEMORY_MAPPING(
+        object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
+    backing->shmid = shmem->shmid;
+    backing->offset = 0;
+    backing->len = size;
+    backing->fixed_va = p;
+    mr = g_new0(MemoryRegion, 1);
+    g_string_printf(mr_name, "virtio-shmem-%d-backing", shmem->shmid);
+    memory_region_init_ram_ptr(mr, OBJECT(backing), mr_name->str, size, p);
+    backing->mr = mr;
+
+    /* Below every subregion a fixed-VA mapping makes. */
+    memory_region_transaction_begin();
+    memory_region_add_subregion_overlap(&shmem->mr, 0, mr, -1);
+    memory_region_transaction_commit();
+    shmem->backing = backing;
+    return backing;
+}
+
+int virtio_shmem_place(VirtioSharedMemory *shmem, int fd, uint64_t fd_offset,
+                       uint64_t shm_offset, uint64_t len)
+{
+    VirtioSharedMemoryMapping *backing = virtio_shmem_backing(shmem);
+    VirtioSharedMemoryMapping *mapping;
+    uint8_t *at;
+    void *p;
+
+    if (!backing) {
+        return -1;
+    }
+    at = (uint8_t *)backing->fixed_va + shm_offset;
+    p = mmap(at, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+             fd_offset);
+    if (p == MAP_FAILED) {
+        error_report("VIRTIO Shared Memory Region %d: mapping 0x%" PRIx64
+                     "+0x%" PRIx64 ": %s", shmem->shmid, shm_offset, len,
+                     strerror(errno));
+        /* A failed MAP_FIXED may have unmapped the range: never a hole. */
+        if (virtio_shmem_empty(at, len) == MAP_FAILED) {
+            error_report("VIRTIO Shared Memory Region %d: refilling 0x%" PRIx64
+                         "+0x%" PRIx64 ": %s", shmem->shmid, shm_offset, len,
+                         strerror(errno));
+            abort();
+        }
+        return -1;
+    }
+
+    mapping = VIRTIO_SHARED_MEMORY_MAPPING(
+        object_new(TYPE_VIRTIO_SHARED_MEMORY_MAPPING));
+    mapping->shmid = shmem->shmid;
+    mapping->offset = shm_offset;
+    mapping->len = len;
+    mapping->in_place = true;
+    QTAILQ_INSERT_TAIL(&shmem->mmaps, mapping, link);
+    return 0;
+}
+
 int virtio_add_shmem_map(VirtioSharedMemory *shmem,
                          VirtioSharedMemoryMapping *mapping)
 {
@@ -3352,6 +3439,25 @@ void virtio_del_shmem_map(VirtioSharedMemory *shmem, hwaddr offset,
 {
     VirtioSharedMemoryMapping *mapping = virtio_find_shmem_map(shmem, offset, size);
     if (mapping == NULL) {
+        return;
+    }
+
+    if (mapping->in_place) {
+        uint8_t *at = (uint8_t *)shmem->backing->fixed_va + mapping->offset;
+
+        /*
+         * Overwritten, not unmapped: the memslot covers the range, and the
+         * MMU notifier has zapped the guest's view of the old pages by the
+         * time this returns.
+         */
+        if (virtio_shmem_empty(at, mapping->len) == MAP_FAILED) {
+            error_report("VIRTIO Shared Memory Region %d: emptying 0x%" PRIx64
+                         "+0x%" PRIx64 ": %s", shmem->shmid, mapping->offset,
+                         mapping->len, strerror(errno));
+            abort();
+        }
+        QTAILQ_REMOVE(&shmem->mmaps, mapping, link);
+        object_unref(OBJECT(mapping));
         return;
     }
 
@@ -3538,8 +3644,7 @@ void virtio_reset(VirtIODevice *vdev)
     QSIMPLEQ_FOREACH(shmem, &vdev->shmem_list, entry) {
         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
             VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
-            virtio_del_shmem_map(shmem, mapping->offset,
-                                 memory_region_size(mapping->mr));
+            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
         }
     }
 }
@@ -4396,8 +4501,12 @@ static void virtio_device_instance_finalize(Object *obj)
         shmem = QSIMPLEQ_FIRST(&vdev->shmem_list);
         while (!QTAILQ_EMPTY(&shmem->mmaps)) {
             VirtioSharedMemoryMapping *mapping = QTAILQ_FIRST(&shmem->mmaps);
-            virtio_del_shmem_map(shmem, mapping->offset,
-                                 memory_region_size(mapping->mr));
+            virtio_del_shmem_map(shmem, mapping->offset, mapping->len);
+        }
+        if (shmem->backing) {
+            memory_region_del_subregion(&shmem->mr, shmem->backing->mr);
+            object_unref(OBJECT(shmem->backing));
+            shmem->backing = NULL;
         }
 
         /* Clean up the embedded MemoryRegion */

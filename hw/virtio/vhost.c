@@ -673,6 +673,19 @@ static bool vhost_section(struct vhost_dev *dev, MemoryRegionSection *section)
             return false;
         }
 
+        /*
+         * VIRTIO Shared Memory mappings were placed by the backend itself
+         * (VHOST_USER_BACKEND_SHMEM_MAP), which already holds the fd. Echoing
+         * them back as guest memory makes the backend mmap the fd a second
+         * time -- for a device fd that can fail and kill it -- and spends a
+         * vhost memory slot per mapping.
+         */
+        if (object_dynamic_cast(memory_region_owner(mr),
+                                TYPE_VIRTIO_SHARED_MEMORY_MAPPING)) {
+            trace_vhost_reject_section(mr->name, 4);
+            return false;
+        }
+
         trace_vhost_section(mr->name);
         return true;
     } else {
